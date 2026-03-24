@@ -3,7 +3,7 @@ import sys
 import sqlite3
 import subprocess
 from pathlib import Path
-
+from PySide6.QtCore import Qt, QThread, Signal, QSize
 # Third-party imports
 import trimesh
 from PySide6.QtCore import Qt, QSize
@@ -137,6 +137,27 @@ def light_stylesheet(accent: str) -> str:
 
 # --- Custom Widgets & Dialogs ---
 
+class SortableTableWidgetItem(QTableWidgetItem):
+    """
+    A custom QTableWidgetItem that allows sorting by a hidden value.
+    Essential for properly sorting file sizes and dates numerically 
+    rather than alphabetically.
+    """
+    def __init__(self, display_text, sort_val=None):
+        super().__init__(display_text)
+        # If a sort value is provided (like raw bytes), use it. Otherwise, use text.
+        self.sort_val = sort_val if sort_val is not None else display_text
+
+    def __lt__(self, other):
+        if isinstance(other, SortableTableWidgetItem):
+            try:
+                return self.sort_val < other.sort_val
+            except TypeError:
+                # Fallback to standard string comparison if types are mismatched
+                return str(self.sort_val) < str(other.sort_val)
+        return super().__lt__(other)
+
+
 class HelpDialog(QDialog):
     def __init__(self, title: str, body: str, parent=None):
         super().__init__(parent)
@@ -192,6 +213,189 @@ class SettingsDialog(QDialog):
 
 
 # --- Main Application Window ---
+class IndexerWorker(QThread):
+    log_line = Signal(str)
+    finished_ok = Signal()
+    failed = Signal(str)
+
+    def __init__(self, db_path: str, library_path: str, exts_csv: str):
+        super().__init__()
+        self.db_path = db_path
+        self.library_path = library_path
+        self.exts_csv = exts_csv
+
+    def run(self):
+        try:
+            db_path = str(Path(self.db_path).expanduser())
+            library_path = str(Path(self.library_path).expanduser())
+
+            exts = {e.strip().lower() for e in self.exts_csv.split(",") if e.strip()}
+            exts = {e if e.startswith(".") else "." + e for e in exts}
+
+            Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+
+            self.log_line.emit(f"[Indexer] Starting scan of {library_path}")
+
+            conn = sqlite3.connect(db_path)
+            mini_indexer.init_db(conn)
+            mini_indexer.scan(conn, library_path, exts=exts, compute_hash=False)
+            conn.close()
+
+            self.log_line.emit("[Indexer] Finished successfully.")
+            self.finished_ok.emit()
+
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class OrganizerWorker(QThread):
+    log_line = Signal(str)
+    finished_ok = Signal()
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        downloads_path: str,
+        library_path: str,
+        log_path: str,
+        copy_mode: bool,
+        dry_run: bool,
+        extract_zips: bool,
+        delete_empty: bool,
+    ):
+        super().__init__()
+        self.downloads_path = downloads_path
+        self.library_path = library_path
+        self.log_path = log_path
+        self.copy_mode = copy_mode
+        self.dry_run = dry_run
+        self.extract_zips = extract_zips
+        self.delete_empty = delete_empty
+
+    def run(self):
+        try:
+            source = Path(self.downloads_path).expanduser().resolve()
+            dest_root = Path(self.library_path).expanduser().resolve()
+            mode = "copy" if self.copy_mode else "move"
+
+            if not source.exists() or not source.is_dir():
+                raise RuntimeError(f"Source folder not found: {source}")
+
+            dest_root.mkdir(parents=True, exist_ok=True)
+            extract_root = dest_root / "_extracted"
+
+            skip_exts = {".exe", ".msi", ".bat", ".cmd", ".ps1", ".reg"}
+            min_bytes = 0
+
+            log_lines = [
+                f"Source: {source}",
+                f"Dest:   {dest_root}",
+                f"Mode:   {mode}",
+                f"Dry:    {self.dry_run}",
+                f"Extract ZIPs: {self.extract_zips}",
+                f"Extract root: {extract_root}",
+                f"Delete empty folders: {self.delete_empty}",
+                "",
+            ]
+
+            considered = 0
+            skipped = 0
+            processed = 0
+            zip_count = 0
+
+            self.log_line.emit(f"[Organizer] Scanning {source}")
+
+            initial_files = list(downloads_organizer.iter_files(source))
+
+            for p in initial_files:
+                considered += 1
+
+                if considered % 25 == 0:
+                    self.log_line.emit(
+                        f"[Organizer] Progress: considered={considered}, processed={processed}, skipped={skipped}"
+                    )
+
+                if downloads_organizer.is_temp_or_partial(p):
+                    skipped += 1
+                    continue
+
+                ext = p.suffix.lower()
+
+                if ext in skip_exts:
+                    skipped += 1
+                    continue
+
+                try:
+                    st = p.stat()
+                except FileNotFoundError:
+                    skipped += 1
+                    continue
+
+                if st.st_size < min_bytes:
+                    skipped += 1
+                    continue
+
+                if ext == ".zip" and self.extract_zips:
+                    extracted_dir = downloads_organizer.extract_zip(
+                        p, extract_root, self.dry_run, log_lines
+                    )
+                    zip_count += 1
+
+                    if downloads_organizer.process_file(
+                        p, dest_root, mode, self.dry_run, log_lines
+                    ):
+                        processed += 1
+
+                    if extracted_dir is not None and extracted_dir.exists():
+                        for extracted_file in downloads_organizer.iter_files(extracted_dir):
+                            if downloads_organizer.is_temp_or_partial(extracted_file):
+                                continue
+                            if extracted_file.suffix.lower() in skip_exts:
+                                continue
+                            try:
+                                if extracted_file.stat().st_size < min_bytes:
+                                    continue
+                            except FileNotFoundError:
+                                continue
+
+                            if downloads_organizer.process_file(
+                                extracted_file, dest_root, mode, self.dry_run, log_lines
+                            ):
+                                processed += 1
+                    continue
+
+                if downloads_organizer.process_file(
+                    p, dest_root, mode, self.dry_run, log_lines
+                ):
+                    processed += 1
+
+            empty_removed = 0
+            if self.delete_empty:
+                empty_removed = downloads_organizer.delete_empty_folders(
+                    source, self.dry_run, log_lines
+                )
+
+            self.log_line.emit(
+                f"[Organizer] Done. considered={considered}, processed={processed}, skipped={skipped}, zips={zip_count}"
+            )
+            if self.delete_empty:
+                self.log_line.emit(f"[Organizer] Empty folders removed: {empty_removed}")
+
+            log_path = Path(self.log_path).expanduser().resolve()
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text("\n".join(log_lines), encoding="utf-8")
+
+            self.finished_ok.emit()
+
+        except Exception as e:
+            self.failed.emit(str(e))
+    def on_organizer_finished(self):
+        self.set_busy(False)
+        self._info("Organizer finished.")
+
+    def on_organizer_failed(self, message: str):
+        self.set_busy(False)
+        self._error(f"Organizer failed: {message}")            
 
 class MiniLibraryApp(QMainWindow):
     def __init__(self):
@@ -228,6 +432,8 @@ class MiniLibraryApp(QMainWindow):
         self.search_input.setPlaceholderText("Search keywords like: orc blitzer blood bowl")
         self.ext_input = QLineEdit(".stl")
         self.ext_input.setMaximumWidth(120)
+        self.search_input.returnPressed.connect(self.search_files)
+        self.ext_input.returnPressed.connect(self.search_files)
         self.limit_spin = QSpinBox()
         self.limit_spin.setRange(1, 5000)
         self.limit_spin.setValue(50)
@@ -268,7 +474,12 @@ class MiniLibraryApp(QMainWindow):
         self.results_table.setAlternatingRowColors(True)
         self.results_table.verticalHeader().setVisible(False)
         self.results_table.itemSelectionChanged.connect(self.on_result_selected)
+        
+        # Enable column sorting by clicking on headers
+        self.results_table.setSortingEnabled(True)
+        
         left_layout.addWidget(self.results_table)
+        
 
         # RIGHT PANEL
         self.right_scroll = QScrollArea()
@@ -449,7 +660,7 @@ class MiniLibraryApp(QMainWindow):
         HelpDialog("Controls", body, self).exec()
 
     def show_about_dialog(self):
-        QMessageBox.about(self, "About Mini Library", "Local miniature STL organizer.\nBuilt with PySide6 and trimesh.")
+        QMessageBox.about(self, "About Mini Library", "Local miniature STL organizer.\nFor questions or donations send inquiries to \nRebelcoreclassnova@gmail.com.")
 
     def _with_button(self, widget, button):
         row = QWidget()
@@ -508,8 +719,14 @@ class MiniLibraryApp(QMainWindow):
 
     def search_files(self):
         db = Path(self.db_path).expanduser()
+        
+        # Disable sorting temporarily while loading data for massive performance boost
+        self.results_table.setSortingEnabled(False)
         self.results_table.setRowCount(0)
-        if not db.exists(): return
+        
+        if not db.exists(): 
+            self.results_table.setSortingEnabled(True)
+            return
 
         query = self.search_input.text().strip().lower()
         ext = self.ext_input.text().strip().lower()
@@ -535,17 +752,27 @@ class MiniLibraryApp(QMainWindow):
             rows = conn.execute(f"SELECT name, ext, size_bytes, mtime_utc, path, tags FROM files WHERE {where_sql} "
                                 f"ORDER BY mtime_utc DESC LIMIT ?", params).fetchall()
             conn.close()
+            
             self.results_table.setRowCount(len(rows))
             for r, row in enumerate(rows):
                 name, ext_v, size, mtime, path, _ = row
-                self.results_table.setItem(r, 0, QTableWidgetItem(str(name)))
-                self.results_table.setItem(r, 1, QTableWidgetItem(str(ext_v)))
-                self.results_table.setItem(r, 2, QTableWidgetItem(human_size(int(size or 0))))
-                self.results_table.setItem(r, 3, QTableWidgetItem(str(mtime)))
-                self.results_table.setItem(r, 4, QTableWidgetItem(str(path)))
+                size_int = int(size or 0)
+                
+                # Use our custom sortable items. 
+                # Strings are set to sort case-insensitively using `.lower()`.
+                self.results_table.setItem(r, 0, SortableTableWidgetItem(str(name), str(name).lower()))
+                self.results_table.setItem(r, 1, SortableTableWidgetItem(str(ext_v), str(ext_v).lower()))
+                self.results_table.setItem(r, 2, SortableTableWidgetItem(human_size(size_int), size_int))
+                self.results_table.setItem(r, 3, SortableTableWidgetItem(str(mtime)))
+                self.results_table.setItem(r, 4, SortableTableWidgetItem(str(path), str(path).lower()))
+                
+            # Re-enable sorting once all data is loaded
+            self.results_table.setSortingEnabled(True)
+            
             if rows: self.results_table.selectRow(0)
             self._info(f"Loaded {len(rows)} result(s).")
         except Exception as e:
+            self.results_table.setSortingEnabled(True)
             self._error(f"Search failed: {e}")
 
     def on_result_selected(self):
