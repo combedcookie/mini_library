@@ -3,11 +3,11 @@ import sys
 import sqlite3
 import subprocess
 from pathlib import Path
-from PySide6.QtCore import Qt, QThread, Signal, QSize
+
 # Third-party imports
 import trimesh
-from PySide6.QtCore import Qt, QSize
-from PySide6.QtGui import QAction, QColor
+from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QColorDialog,
     QComboBox,
+    QAbstractItemView,
 )
 
 # Local module imports
@@ -140,12 +141,11 @@ def light_stylesheet(accent: str) -> str:
 class SortableTableWidgetItem(QTableWidgetItem):
     """
     A custom QTableWidgetItem that allows sorting by a hidden value.
-    Essential for properly sorting file sizes and dates numerically 
+    Essential for properly sorting file sizes and dates numerically
     rather than alphabetically.
     """
     def __init__(self, display_text, sort_val=None):
         super().__init__(display_text)
-        # If a sort value is provided (like raw bytes), use it. Otherwise, use text.
         self.sort_val = sort_val if sort_val is not None else display_text
 
     def __lt__(self, other):
@@ -153,7 +153,6 @@ class SortableTableWidgetItem(QTableWidgetItem):
             try:
                 return self.sort_val < other.sort_val
             except TypeError:
-                # Fallback to standard string comparison if types are mismatched
                 return str(self.sort_val) < str(other.sort_val)
         return super().__lt__(other)
 
@@ -176,18 +175,24 @@ class SettingsDialog(QDialog):
         self.setWindowTitle("Settings")
         self.resize(520, 220)
         self.selected_accent = accent_color
+
         layout = QVBoxLayout(self)
         form = QFormLayout()
+
         self.theme_combo = QComboBox()
         self.theme_combo.addItems(["dark", "light"])
         self.theme_combo.setCurrentText(theme_name)
+
         self.accent_button = QPushButton(f"Accent Color: {accent_color}")
         self.accent_button.clicked.connect(self.pick_accent)
+
         self.slicer_edit = QLineEdit(slicer_path)
+
         form.addRow("Theme", self.theme_combo)
         form.addRow("Accent", self.accent_button)
         form.addRow("Slicer path", self.slicer_edit)
         layout.addLayout(form)
+
         buttons = QHBoxLayout()
         save_btn = QPushButton("Save")
         cancel_btn = QPushButton("Cancel")
@@ -212,7 +217,8 @@ class SettingsDialog(QDialog):
         }
 
 
-# --- Main Application Window ---
+# --- Worker Threads ---
+
 class IndexerWorker(QThread):
     log_line = Signal(str)
     finished_ok = Signal()
@@ -389,13 +395,9 @@ class OrganizerWorker(QThread):
 
         except Exception as e:
             self.failed.emit(str(e))
-    def on_organizer_finished(self):
-        self.set_busy(False)
-        self._info("Organizer finished.")
 
-    def on_organizer_failed(self, message: str):
-        self.set_busy(False)
-        self._error(f"Organizer failed: {message}")            
+
+# --- Main Application Window ---
 
 class MiniLibraryApp(QMainWindow):
     def __init__(self):
@@ -414,6 +416,9 @@ class MiniLibraryApp(QMainWindow):
         self.accent_color = "#ff6b35"
         self.current_selected_path = None
 
+        self.indexer_worker = None
+        self.organizer_worker = None
+
         self._build_ui()
         self.apply_theme()
         self.refresh_status()
@@ -423,17 +428,22 @@ class MiniLibraryApp(QMainWindow):
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
+
         root = QVBoxLayout(central)
         root.setContentsMargins(10, 10, 10, 10)
         root.setSpacing(10)
 
         top_bar = QHBoxLayout()
+
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Search keywords like: orc blitzer blood bowl")
+
         self.ext_input = QLineEdit(".stl")
         self.ext_input.setMaximumWidth(120)
+
         self.search_input.returnPressed.connect(self.search_files)
         self.ext_input.returnPressed.connect(self.search_files)
+
         self.limit_spin = QSpinBox()
         self.limit_spin.setRange(1, 5000)
         self.limit_spin.setValue(50)
@@ -441,6 +451,7 @@ class MiniLibraryApp(QMainWindow):
 
         btn_search = QPushButton("Search")
         btn_search.clicked.connect(self.search_files)
+
         btn_refresh = QPushButton("Refresh")
         btn_refresh.clicked.connect(self.refresh_all)
 
@@ -461,30 +472,32 @@ class MiniLibraryApp(QMainWindow):
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
+
         self.results_table = QTableWidget(0, 5)
         self.results_table.setHorizontalHeaderLabels(["Name", "Ext", "Size", "Modified", "Path"])
+
         header = self.results_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.Stretch)
+
         self.results_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.results_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.results_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.results_table.setAlternatingRowColors(True)
         self.results_table.verticalHeader().setVisible(False)
         self.results_table.itemSelectionChanged.connect(self.on_result_selected)
-        
-        # Enable column sorting by clicking on headers
         self.results_table.setSortingEnabled(True)
-        
+
         left_layout.addWidget(self.results_table)
-        
 
         # RIGHT PANEL
         self.right_scroll = QScrollArea()
         self.right_scroll.setWidgetResizable(True)
         self.right_scroll.setFrameShape(QScrollArea.NoFrame)
+
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         right_layout.setSpacing(10)
@@ -492,6 +505,7 @@ class MiniLibraryApp(QMainWindow):
 
         path_box = QGroupBox("Paths")
         path_form = QFormLayout(path_box)
+
         self.downloads_edit = QLineEdit(self.downloads_path)
         self.library_edit = QLineEdit(self.library_path)
         self.db_edit = QLineEdit(self.db_path)
@@ -500,12 +514,16 @@ class MiniLibraryApp(QMainWindow):
 
         btn_browse_downloads = QPushButton("...")
         btn_browse_downloads.clicked.connect(lambda: self.pick_directory(self.downloads_edit))
+
         btn_browse_library = QPushButton("...")
         btn_browse_library.clicked.connect(lambda: self.pick_directory(self.library_edit))
+
         btn_browse_db = QPushButton("...")
         btn_browse_db.clicked.connect(lambda: self.pick_file(self.db_edit, save_mode=True))
+
         btn_browse_log = QPushButton("...")
         btn_browse_log.clicked.connect(lambda: self.pick_file(self.log_edit, save_mode=True))
+
         btn_browse_slicer = QPushButton("...")
         btn_browse_slicer.clicked.connect(lambda: self.pick_file(self.slicer_edit, save_mode=False))
 
@@ -518,6 +536,7 @@ class MiniLibraryApp(QMainWindow):
         btn_apply_paths = QPushButton("Apply Paths")
         btn_apply_paths.clicked.connect(self.apply_paths)
         path_form.addRow(btn_apply_paths)
+
         right_layout.addWidget(path_box)
 
         status_box = QGroupBox("Status")
@@ -530,23 +549,31 @@ class MiniLibraryApp(QMainWindow):
 
         actions_box = QGroupBox("Actions")
         actions_layout = QGridLayout(actions_box)
+
         btn_open_file = QPushButton("Open File")
         btn_open_file.clicked.connect(self.open_selected_file)
+
         btn_open_folder = QPushButton("Open Folder")
         btn_open_folder.clicked.connect(self.open_selected_folder)
+
         btn_launch_slicer = QPushButton("Launch in Slicer")
         btn_launch_slicer.clicked.connect(self.launch_selected_in_slicer)
+
         btn_organize = QPushButton("Run Organizer")
         btn_organize.clicked.connect(self.run_organizer)
+
         btn_index = QPushButton("Rebuild Index")
         btn_index.clicked.connect(self.run_indexer)
 
         self.dry_run_check = QCheckBox("Dry run")
         self.dry_run_check.setChecked(True)
+
         self.copy_mode_check = QCheckBox("Use copy instead of move")
         self.copy_mode_check.setChecked(True)
+
         self.extract_zip_check = QCheckBox("Extract ZIPs")
         self.extract_zip_check.setChecked(True)
+
         self.delete_empty_check = QCheckBox("Delete empty folders")
 
         actions_layout.addWidget(btn_open_file, 0, 0)
@@ -558,18 +585,19 @@ class MiniLibraryApp(QMainWindow):
         actions_layout.addWidget(self.copy_mode_check, 3, 1)
         actions_layout.addWidget(self.extract_zip_check, 4, 0)
         actions_layout.addWidget(self.delete_empty_check, 4, 1)
+
         right_layout.addWidget(actions_box)
 
         preview_box = QGroupBox("3D Preview")
         preview_layout = QVBoxLayout(preview_box)
-        
+
         self.preview_info_label = QLabel("Select a file to view.")
         self.preview_info_label.setAlignment(Qt.AlignCenter)
         self.preview_info_label.setMinimumHeight(40)
-        
+
         self.btn_open_3d = QPushButton("Open Interactive 3D Viewer")
         self.btn_open_3d.clicked.connect(self.open_3d_viewer)
-        self.btn_open_3d.setEnabled(False) # Disabled by default until a file is selected
+        self.btn_open_3d.setEnabled(False)
 
         preview_layout.addWidget(self.preview_info_label)
         preview_layout.addWidget(self.btn_open_3d)
@@ -577,22 +605,27 @@ class MiniLibraryApp(QMainWindow):
 
         meta_box = QGroupBox("Details")
         meta_layout = QVBoxLayout(meta_box)
+
         self.details_text = QTextEdit()
         self.details_text.setReadOnly(True)
         self.details_text.setMinimumHeight(100)
+
         meta_layout.addWidget(self.details_text)
         right_layout.addWidget(meta_box)
 
         output_box = QGroupBox("Command Output")
         output_layout = QVBoxLayout(output_box)
+
         self.output_text = QTextEdit()
         self.output_text.setReadOnly(True)
         self.output_text.setMinimumHeight(100)
+
         output_layout.addWidget(self.output_text)
         right_layout.addWidget(output_box)
         right_layout.addStretch(1)
 
         self.right_scroll.setWidget(right_panel)
+
         splitter.addWidget(left_panel)
         splitter.addWidget(self.right_scroll)
         splitter.setSizes([1000, 600])
@@ -603,6 +636,7 @@ class MiniLibraryApp(QMainWindow):
 
     def _build_menu(self):
         bar = self.menuBar()
+
         file_menu = bar.addMenu("File")
         file_menu.addAction("Open Library", lambda: self.try_open_path(self.library_path))
         file_menu.addAction("Open Downloads", lambda: self.try_open_path(self.downloads_path))
@@ -650,17 +684,33 @@ class MiniLibraryApp(QMainWindow):
             self._info("Settings updated.")
 
     def show_quick_start(self):
-        body = ("Mini Library Quick Start\n\n1. Set paths.\n2. Click 'Apply Paths'.\n"
-                "3. Rebuild Index.\n4. Search your files.\n5. Click 'Open Interactive 3D Viewer' to inspect a model.")
+        body = (
+            "Mini Library Quick Start\n\n"
+            "1. Set paths.\n"
+            "2. Click 'Apply Paths'.\n"
+            "3. Rebuild Index.\n"
+            "4. Search your files.\n"
+            "5. Select one or more files and click 'Launch in Slicer'.\n"
+            "6. Select one file and click 'Open Interactive 3D Viewer' to inspect a model."
+        )
         HelpDialog("Quick Start", body, self).exec()
 
     def show_controls_help(self):
-        body = ("- Search: local database query.\n- Open File: system default.\n"
-                "- Launch in Slicer: user defined path.\n- Open Interactive 3D Viewer: opens a dedicated window to inspect the 3D model.")
+        body = (
+            "- Search: local database query.\n"
+            "- Open File: opens the currently selected file.\n"
+            "- Open Folder: opens the folder for the current selection.\n"
+            "- Launch in Slicer: launches one or more selected files in the slicer.\n"
+            "- Open Interactive 3D Viewer: opens a dedicated window to inspect one 3D model."
+        )
         HelpDialog("Controls", body, self).exec()
 
     def show_about_dialog(self):
-        QMessageBox.about(self, "About Mini Library", "Local miniature STL organizer.\nFor questions or donations send inquiries to \nRebelcoreclassnova@gmail.com.")
+        QMessageBox.about(
+            self,
+            "About Mini Library",
+            "Local miniature STL organizer.\nFor questions or donations send inquiries to\nRebelcoreclassnova@gmail.com."
+        )
 
     def _with_button(self, widget, button):
         row = QWidget()
@@ -671,16 +721,45 @@ class MiniLibraryApp(QMainWindow):
         lay.addWidget(button, 0)
         return row
 
+    def set_busy(self, busy: bool):
+        self.search_input.setEnabled(not busy)
+        self.ext_input.setEnabled(not busy)
+        self.limit_spin.setEnabled(not busy)
+
+        self.downloads_edit.setEnabled(not busy)
+        self.library_edit.setEnabled(not busy)
+        self.db_edit.setEnabled(not busy)
+        self.log_edit.setEnabled(not busy)
+        self.slicer_edit.setEnabled(not busy)
+
+        self.dry_run_check.setEnabled(not busy)
+        self.copy_mode_check.setEnabled(not busy)
+        self.extract_zip_check.setEnabled(not busy)
+        self.delete_empty_check.setEnabled(not busy)
+
+    def get_selected_paths(self) -> list[str]:
+        rows = sorted({item.row() for item in self.results_table.selectedItems()})
+        paths: list[str] = []
+
+        for row in rows:
+            path_item = self.results_table.item(row, 4)
+            if path_item:
+                paths.append(path_item.text())
+
+        return paths
+
     def pick_directory(self, target: QLineEdit):
         start = str(Path(target.text()).expanduser().parent) if target.text().strip() else str(Path.home())
         path = QFileDialog.getExistingDirectory(self, "Choose Directory", start)
-        if path: target.setText(path)
+        if path:
+            target.setText(path)
 
     def pick_file(self, target: QLineEdit, save_mode: bool = False):
         start = str(Path(target.text()).expanduser().parent) if target.text().strip() else str(Path.home())
         func = QFileDialog.getSaveFileName if save_mode else QFileDialog.getOpenFileName
         path, _ = func(self, "Choose File", start)
-        if path: target.setText(path)
+        if path:
+            target.setText(path)
 
     def apply_paths(self):
         self.downloads_path = self.downloads_edit.text().strip()
@@ -696,14 +775,20 @@ class MiniLibraryApp(QMainWindow):
         l_ok = Path(self.library_path).expanduser().exists()
         db_ok = Path(self.db_path).expanduser().exists()
         s_ok = bool(self.slicer_path.strip()) and Path(self.slicer_path).expanduser().exists()
-        self.status_label.setText(f"Downloads: {'✅' if d_ok else '❌'}  Library: {'✅' if l_ok else '❌'}  "
-                                  f"Database: {'✅' if db_ok else '❌'}  Slicer: {'✅' if s_ok else '⚪'}")
+
+        self.status_label.setText(
+            f"Downloads: {'✅' if d_ok else '❌'}  "
+            f"Library: {'✅' if l_ok else '❌'}  "
+            f"Database: {'✅' if db_ok else '❌'}  "
+            f"Slicer: {'✅' if s_ok else '⚪'}"
+        )
 
     def refresh_stats(self):
         db = Path(self.db_path).expanduser()
         if not db.exists():
             self.stats_label.setText("Indexed files: 0")
             return
+
         try:
             conn = sqlite3.connect(str(db))
             total = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
@@ -719,12 +804,11 @@ class MiniLibraryApp(QMainWindow):
 
     def search_files(self):
         db = Path(self.db_path).expanduser()
-        
-        # Disable sorting temporarily while loading data for massive performance boost
+
         self.results_table.setSortingEnabled(False)
         self.results_table.setRowCount(0)
-        
-        if not db.exists(): 
+
+        if not db.exists():
             self.results_table.setSortingEnabled(True)
             return
 
@@ -740,7 +824,8 @@ class MiniLibraryApp(QMainWindow):
             params.extend([like, like, like])
 
         if ext:
-            if not ext.startswith("."): ext = "." + ext
+            if not ext.startswith("."):
+                ext = "." + ext
             where.append("ext = ?")
             params.append(ext)
 
@@ -749,48 +834,65 @@ class MiniLibraryApp(QMainWindow):
 
         try:
             conn = sqlite3.connect(str(db))
-            rows = conn.execute(f"SELECT name, ext, size_bytes, mtime_utc, path, tags FROM files WHERE {where_sql} "
-                                f"ORDER BY mtime_utc DESC LIMIT ?", params).fetchall()
+            rows = conn.execute(
+                f"SELECT name, ext, size_bytes, mtime_utc, path, tags "
+                f"FROM files WHERE {where_sql} "
+                f"ORDER BY mtime_utc DESC LIMIT ?",
+                params,
+            ).fetchall()
             conn.close()
-            
+
             self.results_table.setRowCount(len(rows))
             for r, row in enumerate(rows):
                 name, ext_v, size, mtime, path, _ = row
                 size_int = int(size or 0)
-                
-                # Use our custom sortable items. 
-                # Strings are set to sort case-insensitively using `.lower()`.
+
                 self.results_table.setItem(r, 0, SortableTableWidgetItem(str(name), str(name).lower()))
                 self.results_table.setItem(r, 1, SortableTableWidgetItem(str(ext_v), str(ext_v).lower()))
                 self.results_table.setItem(r, 2, SortableTableWidgetItem(human_size(size_int), size_int))
                 self.results_table.setItem(r, 3, SortableTableWidgetItem(str(mtime)))
                 self.results_table.setItem(r, 4, SortableTableWidgetItem(str(path), str(path).lower()))
-                
-            # Re-enable sorting once all data is loaded
+
             self.results_table.setSortingEnabled(True)
-            
-            if rows: self.results_table.selectRow(0)
+
+            if rows:
+                self.results_table.selectRow(0)
+
             self._info(f"Loaded {len(rows)} result(s).")
+
         except Exception as e:
             self.results_table.setSortingEnabled(True)
             self._error(f"Search failed: {e}")
 
     def on_result_selected(self):
-        row = self.results_table.currentRow()
-        if row < 0: return
-        path_item = self.results_table.item(row, 4)
-        if not path_item: return
-        
-        self.current_selected_path = path_item.text()
+        selected_paths = self.get_selected_paths()
+
+        if not selected_paths:
+            self.current_selected_path = None
+            self.details_text.clear()
+            self.preview_info_label.setText("Select a file to view.")
+            self.btn_open_3d.setEnabled(False)
+            return
+
+        if len(selected_paths) > 1:
+            self.current_selected_path = selected_paths[0]
+            self.details_text.setPlainText(
+                f"{len(selected_paths)} files selected.\n\nFirst file:\n{selected_paths[0]}"
+            )
+            self.preview_info_label.setText(
+                f"{len(selected_paths)} files selected.\n3D preview is limited to one file at a time."
+            )
+            self.btn_open_3d.setEnabled(False)
+            return
+
+        self.current_selected_path = selected_paths[0]
         p = Path(self.current_selected_path)
-        
-        # Update metadata details
+
         details = [f"Name: {p.name}", f"Path: {p}", f"Parent: {p.parent}"]
         if p.exists():
             details.append(f"Size: {human_size(p.stat().st_size)}")
         self.details_text.setPlainText("\n".join(details))
-        
-        # Update Preview Box State
+
         if p.suffix.lower() in [".stl", ".obj", ".3mf"]:
             self.preview_info_label.setText(f"Ready to view:\n{p.name}")
             self.btn_open_3d.setEnabled(True)
@@ -802,13 +904,13 @@ class MiniLibraryApp(QMainWindow):
         if not self.current_selected_path:
             self._warn("Select a file first.")
             return
-            
+
         p = Path(self.current_selected_path)
-        
+
         self._info(f"Opening 3D viewer for {p.name}...")
         self.btn_open_3d.setEnabled(False)
-        QApplication.processEvents() # Ensure the UI updates before the blocking call
-        
+        QApplication.processEvents()
+
         try:
             mesh = trimesh.load(str(p), force="mesh")
             if isinstance(mesh, trimesh.Scene):
@@ -816,7 +918,7 @@ class MiniLibraryApp(QMainWindow):
             else:
                 scene = trimesh.Scene(mesh)
                 scene.show(title=f"3D Preview: {p.name}")
-                
+
             self._info("3D viewer closed.")
         except Exception as e:
             self._error(f"Could not open 3D viewer: {e}")
@@ -824,76 +926,133 @@ class MiniLibraryApp(QMainWindow):
             self.btn_open_3d.setEnabled(True)
 
     def open_selected_file(self):
-        if self.current_selected_path: self.try_open_path(self.current_selected_path)
+        selected_paths = self.get_selected_paths()
+        if not selected_paths:
+            self._warn("Select one or more files first.")
+            return
+
+        for path in selected_paths:
+            try:
+                open_path(path)
+            except Exception as e:
+                self._error(str(e))
+                break
 
     def open_selected_folder(self):
-        if self.current_selected_path: self.try_open_path(str(Path(self.current_selected_path).parent))
+        selected_paths = self.get_selected_paths()
+        if not selected_paths:
+            self._warn("Select one or more files first.")
+            return
+
+        try:
+            folders = sorted({str(Path(path).parent) for path in selected_paths})
+            for folder in folders:
+                open_path(folder)
+        except Exception as e:
+            self._error(str(e))
 
     def launch_selected_in_slicer(self):
-        if not self.current_selected_path or not self.slicer_path.strip(): return
+        selected_paths = self.get_selected_paths()
+        if not selected_paths:
+            self._warn("Select one or more files first.")
+            return
+
+        if not self.slicer_path.strip():
+            self._warn("Set your slicer path first.")
+            return
+
         slicer = Path(self.slicer_path).expanduser()
-        if not slicer.exists(): return
+        if not slicer.exists():
+            self._error("Slicer path does not exist.")
+            return
+
         try:
-            subprocess.Popen([str(slicer), "--no-sandbox", str(Path(self.current_selected_path).expanduser())])
+            cmd = [str(slicer)]
+            if sys.platform.startswith("linux"):
+                cmd.append("--no-sandbox")
+
+            cmd.extend(selected_paths)
+            subprocess.Popen(cmd)
+            self._info(f"Launched slicer with {len(selected_paths)} file(s).")
         except Exception as e:
             self._error(f"Slicer error: {e}")
 
     def run_organizer(self):
-        try:
-            source = Path(self.downloads_path).expanduser().resolve()
-            dest_root = Path(self.library_path).expanduser().resolve()
-            mode = "copy" if self.copy_mode_check.isChecked() else "move"
-            dry_run = self.dry_run_check.isChecked()
-            extract_zips = self.extract_zip_check.isChecked()
-            delete_empty = self.delete_empty_check.isChecked()
+        if self.organizer_worker and self.organizer_worker.isRunning():
+            self._warn("Organizer is already running.")
+            return
 
-            if not source.exists(): return
-            dest_root.mkdir(parents=True, exist_ok=True)
-            log_lines = [f"Source: {source}", f"Dest: {dest_root}", f"Mode: {mode}", f"Dry: {dry_run}"]
-            
-            self.output_text.clear()
-            self.output_text.append(f"[Organizer] Scanning {source}")
-            initial_files = list(downloads_organizer.iter_files(source))
-            processed = 0
+        self.output_text.clear()
+        self.output_text.append("[Organizer] Starting...")
+        self.set_busy(True)
 
-            for p in initial_files:
-                if downloads_organizer.is_temp_or_partial(p): continue
-                if p.suffix.lower() == ".zip" and extract_zips:
-                    downloads_organizer.extract_zip(p, dest_root / "_extracted", dry_run, log_lines)
-                if downloads_organizer.process_file(p, dest_root, mode, dry_run, log_lines):
-                    processed += 1
+        self.organizer_worker = OrganizerWorker(
+            self.downloads_path,
+            self.library_path,
+            self.log_path,
+            self.copy_mode_check.isChecked(),
+            self.dry_run_check.isChecked(),
+            self.extract_zip_check.isChecked(),
+            self.delete_empty_check.isChecked(),
+        )
+        self.organizer_worker.log_line.connect(self.append_output_line)
+        self.organizer_worker.finished_ok.connect(self.on_organizer_finished)
+        self.organizer_worker.failed.connect(self.on_organizer_failed)
+        self.organizer_worker.start()
 
-            if delete_empty: downloads_organizer.delete_empty_folders(source, dry_run, log_lines)
-            self.output_text.append(f"\n[done] processed: {processed}")
-            self._info("Organizer finished.")
-        except Exception as e:
-            self._error(f"Organizer failed: {e}")
+    def on_organizer_finished(self):
+        self.set_busy(False)
+        self._info("Organizer finished.")
+
+    def on_organizer_failed(self, message: str):
+        self.set_busy(False)
+        self._error(f"Organizer failed: {message}")
 
     def run_indexer(self):
-        try:
-            db_p = str(Path(self.db_path).expanduser())
-            lib_p = str(Path(self.library_path).expanduser())
-            exts = {e.strip().lower() for e in DEFAULT_EXTS.split(",") if e.strip()}
-            exts = {e if e.startswith(".") else "." + e for e in exts}
-            Path(db_p).parent.mkdir(parents=True, exist_ok=True)
-            conn = sqlite3.connect(db_p)
-            mini_indexer.init_db(conn)
-            mini_indexer.scan(conn, lib_p, exts=exts, compute_hash=False)
-            conn.close()
-            self.output_text.append("[Indexer] Finished.")
-            self.refresh_all()
-        except Exception as e:
-            self._error(f"Indexer failed: {e}")
+        if self.indexer_worker and self.indexer_worker.isRunning():
+            self._warn("Indexer is already running.")
+            return
 
-    def append_output_line(self, text): self.output_text.append(text)
+        self.output_text.clear()
+        self.output_text.append("[Indexer] Starting...")
+        self.set_busy(True)
+
+        self.indexer_worker = IndexerWorker(
+            self.db_path,
+            self.library_path,
+            DEFAULT_EXTS,
+        )
+        self.indexer_worker.log_line.connect(self.append_output_line)
+        self.indexer_worker.finished_ok.connect(self.on_indexer_finished)
+        self.indexer_worker.failed.connect(self.on_indexer_failed)
+        self.indexer_worker.start()
+
+    def on_indexer_finished(self):
+        self.set_busy(False)
+        self.refresh_all()
+        self._info("Indexer finished.")
+
+    def on_indexer_failed(self, message: str):
+        self.set_busy(False)
+        self._error(f"Indexer failed: {message}")
+
+    def append_output_line(self, text):
+        self.output_text.append(text)
 
     def try_open_path(self, path_str: str):
-        try: open_path(path_str)
-        except Exception as e: self._error(str(e))
+        try:
+            open_path(path_str)
+        except Exception as e:
+            self._error(str(e))
 
-    def _info(self, msg: str): self.statusBar().showMessage(msg, 5000)
-    def _warn(self, msg: str): QMessageBox.warning(self, "Mini Library", msg)
-    def _error(self, msg: str): QMessageBox.critical(self, "Mini Library", msg)
+    def _info(self, msg: str):
+        self.statusBar().showMessage(msg, 5000)
+
+    def _warn(self, msg: str):
+        QMessageBox.warning(self, "Mini Library", msg)
+
+    def _error(self, msg: str):
+        QMessageBox.critical(self, "Mini Library", msg)
 
 
 def main():
@@ -901,6 +1060,7 @@ def main():
     window = MiniLibraryApp()
     window.show()
     sys.exit(app.exec())
+
 
 if __name__ == "__main__":
     main()
