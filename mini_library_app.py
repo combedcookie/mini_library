@@ -1,5 +1,6 @@
 import os
 import sys
+import math
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -415,6 +416,10 @@ class MiniLibraryApp(QMainWindow):
         self.theme_name = "dark"
         self.accent_color = "#ff6b35"
         self.current_selected_path = None
+        
+        # Pagination States
+        self.current_page = 1
+        self.total_pages = 1
 
         self.indexer_worker = None
         self.organizer_worker = None
@@ -423,7 +428,7 @@ class MiniLibraryApp(QMainWindow):
         self.apply_theme()
         self.refresh_status()
         self.refresh_stats()
-        self.search_files()
+        self.trigger_search()
 
     def _build_ui(self):
         central = QWidget()
@@ -441,8 +446,8 @@ class MiniLibraryApp(QMainWindow):
         self.ext_input = QLineEdit(".stl")
         self.ext_input.setMaximumWidth(120)
 
-        self.search_input.returnPressed.connect(self.search_files)
-        self.ext_input.returnPressed.connect(self.search_files)
+        self.search_input.returnPressed.connect(self.trigger_search)
+        self.ext_input.returnPressed.connect(self.trigger_search)
 
         self.limit_spin = QSpinBox()
         self.limit_spin.setRange(1, 5000)
@@ -450,7 +455,7 @@ class MiniLibraryApp(QMainWindow):
         self.limit_spin.setMaximumWidth(90)
 
         btn_search = QPushButton("Search")
-        btn_search.clicked.connect(self.search_files)
+        btn_search.clicked.connect(self.trigger_search)
 
         btn_refresh = QPushButton("Refresh")
         btn_refresh.clicked.connect(self.refresh_all)
@@ -459,7 +464,7 @@ class MiniLibraryApp(QMainWindow):
         top_bar.addWidget(self.search_input, 1)
         top_bar.addWidget(QLabel("Ext"))
         top_bar.addWidget(self.ext_input)
-        top_bar.addWidget(QLabel("Limit"))
+        top_bar.addWidget(QLabel("Limit/Page"))
         top_bar.addWidget(self.limit_spin)
         top_bar.addWidget(btn_search)
         top_bar.addWidget(btn_refresh)
@@ -492,6 +497,25 @@ class MiniLibraryApp(QMainWindow):
         self.results_table.setSortingEnabled(True)
 
         left_layout.addWidget(self.results_table)
+        
+        # Pagination UI
+        pagination_layout = QHBoxLayout()
+        self.btn_prev_page = QPushButton("< Prev")
+        self.btn_prev_page.clicked.connect(self.prev_page)
+        self.btn_prev_page.setEnabled(False)
+        
+        self.lbl_page_info = QLabel("Page 1 of 1")
+        self.lbl_page_info.setAlignment(Qt.AlignCenter)
+        
+        self.btn_next_page = QPushButton("Next >")
+        self.btn_next_page.clicked.connect(self.next_page)
+        self.btn_next_page.setEnabled(False)
+        
+        pagination_layout.addWidget(self.btn_prev_page)
+        pagination_layout.addWidget(self.lbl_page_info, 1)
+        pagination_layout.addWidget(self.btn_next_page)
+        
+        left_layout.addLayout(pagination_layout)
 
         # RIGHT PANEL
         self.right_scroll = QScrollArea()
@@ -725,6 +749,9 @@ class MiniLibraryApp(QMainWindow):
         self.search_input.setEnabled(not busy)
         self.ext_input.setEnabled(not busy)
         self.limit_spin.setEnabled(not busy)
+        
+        self.btn_prev_page.setEnabled(not busy)
+        self.btn_next_page.setEnabled(not busy)
 
         self.downloads_edit.setEnabled(not busy)
         self.library_edit.setEnabled(not busy)
@@ -800,9 +827,27 @@ class MiniLibraryApp(QMainWindow):
     def refresh_all(self):
         self.refresh_status()
         self.refresh_stats()
-        self.search_files()
+        self.trigger_search()
 
-    def search_files(self):
+    def trigger_search(self, *args):
+        """Resets to page 1 and performs a new search"""
+        self.current_page = 1
+        self.perform_search()
+
+    def prev_page(self):
+        """Moves back one page if possible"""
+        if self.current_page > 1:
+            self.current_page -= 1
+            self.perform_search()
+
+    def next_page(self):
+        """Moves forward one page if possible"""
+        if self.current_page < self.total_pages:
+            self.current_page += 1
+            self.perform_search()
+
+    def perform_search(self):
+        """Queries the database and displays the current page of results"""
         db = Path(self.db_path).expanduser()
 
         self.results_table.setSortingEnabled(False)
@@ -810,6 +855,9 @@ class MiniLibraryApp(QMainWindow):
 
         if not db.exists():
             self.results_table.setSortingEnabled(True)
+            self.lbl_page_info.setText("Page 1 of 1")
+            self.btn_prev_page.setEnabled(False)
+            self.btn_next_page.setEnabled(False)
             return
 
         query = self.search_input.text().strip().lower()
@@ -830,15 +878,31 @@ class MiniLibraryApp(QMainWindow):
             params.append(ext)
 
         where_sql = " AND ".join(where) if where else "1=1"
-        params.append(limit)
 
         try:
             conn = sqlite3.connect(str(db))
+            
+            # --- Get the Total Item Count for Pagination ---
+            count_query = f"SELECT COUNT(*) FROM files WHERE {where_sql}"
+            total_items = conn.execute(count_query, params).fetchone()[0]
+            
+            # Calculate total pages
+            self.total_pages = max(1, math.ceil(total_items / limit) if limit > 0 else 1)
+            
+            # Ensure current page is valid after a search limits shrink
+            if self.current_page > self.total_pages:
+                self.current_page = self.total_pages
+                
+            # Calculate Offset for SQL query
+            offset = (self.current_page - 1) * limit
+            
+            # --- Fetch the specific chunk/page ---
+            select_params = params + [limit, offset]
             rows = conn.execute(
                 f"SELECT name, ext, size_bytes, mtime_utc, path, tags "
                 f"FROM files WHERE {where_sql} "
-                f"ORDER BY mtime_utc DESC LIMIT ?",
-                params,
+                f"ORDER BY mtime_utc DESC LIMIT ? OFFSET ?",
+                select_params,
             ).fetchall()
             conn.close()
 
@@ -857,8 +921,13 @@ class MiniLibraryApp(QMainWindow):
 
             if rows:
                 self.results_table.selectRow(0)
+                
+            # --- Update UI Pagination Controls ---
+            self.lbl_page_info.setText(f"Page {self.current_page} of {self.total_pages} ({total_items} matching items)")
+            self.btn_prev_page.setEnabled(self.current_page > 1)
+            self.btn_next_page.setEnabled(self.current_page < self.total_pages)
 
-            self._info(f"Loaded {len(rows)} result(s).")
+            self._info(f"Loaded page {self.current_page}. Showing {len(rows)} result(s).")
 
         except Exception as e:
             self.results_table.setSortingEnabled(True)
